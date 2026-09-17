@@ -8,7 +8,7 @@ resolution, and membership in the OpenAI-compatible set.
 
 from __future__ import annotations
 
-import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,6 +40,42 @@ class TestAtlasCloudConstants:
 
 
 class TestAtlasCloudCredentials:
+    @pytest.mark.parametrize(
+        "model_attr", ["enrichment_model", "contradiction_model", "recall_model"]
+    )
+    @pytest.mark.parametrize(
+        "model", ["openai/gpt-4.1-mini", "gpt-4.1-mini", "claude-sonnet-4-6"]
+    )
+    def test_resolve_preserves_tenant_model(self, monkeypatch, model_attr, model):
+        monkeypatch.setenv(model_attr.upper(), "openai/env-fallback")
+        config = SimpleNamespace(**{model_attr: model})
+        assert (
+            resolve_openai_compatible("atlascloud", config, model_attr=model_attr)[2]
+            == model
+        )
+
+    @pytest.mark.parametrize("model", ["gpt-4.1-mini", "claude-sonnet-4-6"])
+    def test_resolve_uses_per_service_env_model(self, monkeypatch, model):
+        monkeypatch.setenv("RECALL_MODEL", model)
+        config = SimpleNamespace(enrichment_model="openai/different-service")
+        assert (
+            resolve_openai_compatible("atlascloud", config, model_attr="recall_model")[
+                2
+            ]
+            == model
+        )
+
+    @pytest.mark.parametrize("model", [None, "", "   ", 42])
+    def test_resolve_uses_default_without_valid_model(self, monkeypatch, model):
+        monkeypatch.delenv("RECALL_MODEL", raising=False)
+        config = SimpleNamespace(recall_model=model)
+        assert (
+            resolve_openai_compatible("atlascloud", config, model_attr="recall_model")[
+                2
+            ]
+            == ATLASCLOUD_DEFAULT_MODEL
+        )
+
     def test_env_key(self, monkeypatch):
         monkeypatch.setenv("ATLASCLOUD_API_KEY", "apikey-from-env")
         assert _env_key(ProviderName.ATLASCLOUD) == "apikey-from-env"

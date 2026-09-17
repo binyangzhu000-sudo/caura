@@ -140,6 +140,10 @@ def _model_for_provider(
     # harder to see.
     if not isinstance(configured, str) or not configured.strip():
         return default_model
+    # Atlas serves multiple model families and accepts some bare aliases.
+    # Let its API validate availability instead of replacing explicit choices.
+    if provider == ProviderName.ATLASCLOUD:
+        return configured
     family = _model_family(configured)
     if family is not None and family != provider:
         logger.warning(
@@ -231,7 +235,10 @@ def resolve_openai_compatible(
             or _env_key(ProviderName.ATLASCLOUD)
             or ""
         )
-        return key, ATLASCLOUD_CHAT_BASE_URL, ATLASCLOUD_DEFAULT_MODEL
+        model = _model_for_provider(
+            provider, tenant_config, model_attr, ATLASCLOUD_DEFAULT_MODEL
+        )
+        return key, ATLASCLOUD_CHAT_BASE_URL, model
 
     return "", "", ""
 
