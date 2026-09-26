@@ -7,10 +7,11 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from core_api.agent_ids import AgentIdentity
+from core_api.agent_ids import AgentIdentity, canonical_service_agent_id
 from core_api.clients.storage_client import get_storage_client
 from core_api.constants import DEFAULT_TRUST_LEVEL
 from core_api.errors import (
+    AUTH_AGENT_IDENTITY_MISMATCH,
     AUTH_AGENT_NOT_REGISTERED,
     AUTH_AGENT_TRUST_TOO_LOW,
     AUTH_FLEET_SCOPE_FORBIDDEN,
@@ -43,6 +44,7 @@ async def get_or_create_agent(
     install identity is stable for the row's lifetime.
     """
     sc = get_storage_client()
+    agent_id = canonical_service_agent_id(agent_id)
     agent = await sc.get_agent(agent_id, tenant_id)
     if agent is None:
         # Confirm a MISS against the primary before creating. A miss is the
@@ -84,7 +86,9 @@ async def get_or_create_agent(
         if backfill:
             agent.update(backfill)
             agent["updated_at"] = datetime.now(UTC)
-            await sc.create_or_update_agent({"tenant_id": tenant_id, "agent_id": agent_id, **backfill})
+            await sc.create_or_update_agent(
+                {"tenant_id": tenant_id, "agent_id": agent["agent_id"], **backfill}
+            )
         return agent
 
     # Legacy-main carryover: pre-Task6 plugins all defaulted to
@@ -157,9 +161,9 @@ async def get_or_create_agent(
     return agent
 
 
-async def lookup_agent(tenant_id: str, agent_id: str) -> dict | None:
+async def lookup_agent(tenant_id: str, agent_id: str, *, read: bool = True) -> dict | None:
     sc = get_storage_client()
-    return await sc.get_agent(agent_id, tenant_id)
+    return await sc.get_agent(canonical_service_agent_id(agent_id), tenant_id, read=read)
 
 
 _BROKER_LABEL_PREFIX = "broker:"
@@ -235,6 +239,31 @@ async def broker_owned_agent_id(chosen: str, install_uuid: str | None, tenant_id
     return AgentIdentity(chosen)
 
 
+async def enforce_broker_agent_ownership(
+    tenant_id: str,
+    agent_id: str,
+    install_uuid: str | None,
+) -> None:
+    """Require an install credential to own an existing agent row.
+
+    Write attribution is intentionally lenient on first touch, but reads and
+    deletes of per-agent private state cannot claim an unowned name. A missing
+    install id, missing row, legacy unclaimed row, or different owner therefore
+    fails closed without disclosing which case applied.
+    """
+    owner = await lookup_agent(tenant_id, agent_id) if install_uuid else None
+    if owner and owner.get("owner_install_uuid") == install_uuid:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=coded_detail(
+            AUTH_AGENT_IDENTITY_MISMATCH,
+            "Install credential does not own the requested agent.",
+            field="agent_id",
+        ),
+    )
+
+
 async def resolve_write_agent(
     chosen_agent_id: str,
     tenant_id: str,
@@ -266,6 +295,7 @@ async def resolve_write_agent(
     on ``is_install_credential`` (a stray ``install_uuid`` without the credential
     kind is ignored).
     """
+    chosen_agent_id = canonical_service_agent_id(chosen_agent_id)
     if is_install_credential:
         chosen_agent_id = await broker_owned_agent_id(chosen_agent_id, install_uuid, tenant_id)
     agent = await get_or_create_agent(
@@ -325,6 +355,41 @@ async def enforce_fleet_read(
 ) -> None:
     """Enforce read permissions for search/list (read-only — never creates agents)."""
     await enforce_fleet_read_many(tenant_id, agent_id, [fleet_id])
+
+
+async def enforce_registered_fleet_read(
+    tenant_id: str,
+    agent_id: AgentIdentity,
+    fleet_id: str,
+) -> None:
+    """Enforce the full trust ladder for a named fleet read.
+
+    Unlike :func:`enforce_fleet_read`, this fails closed for an unregistered
+    identity. That stricter contract is for private fleet state such as STM
+    bulletins, where an unknown caller cannot prove that any fleet is its own.
+    """
+    agent = await lookup_agent(tenant_id, agent_id)
+    if not agent:
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                AUTH_AGENT_NOT_REGISTERED,
+                "Agent is not registered and cannot read fleet-private state.",
+            ),
+        )
+
+    own_fleet = agent.get("fleet_id")
+    trust = agent.get("trust_level", 0)
+    required = 1 if fleet_id == own_fleet else 2
+    if trust < required:
+        code = AUTH_AGENT_TRUST_TOO_LOW if required == 1 else AUTH_FLEET_SCOPE_FORBIDDEN
+        raise HTTPException(
+            status_code=403,
+            detail=coded_detail(
+                code,
+                f"fleet-scope policy: trust level {required} is required for this bulletin.",
+            ),
+        )
 
 
 async def enforce_fleet_read_many(
@@ -424,7 +489,7 @@ async def resolve_read_fleet_gate(
     if scope == "all":
         return 2, fleet_id
     # scope == "fleet": decide by target fleet vs the caller's home fleet.
-    agent = await get_storage_client().get_agent(agent_id, tenant_id)
+    agent = await lookup_agent(tenant_id, agent_id)
     home_fleet = (agent or {}).get("fleet_id")
     # trust_level pre-read from the agent storage row (agents.trust_level is the
     # single source of truth; update_trust_level writes it directly). Used to:
@@ -540,7 +605,7 @@ def memory_access_allowed_for_agent(
     boundary this helper guards).
     """
     if visibility == "scope_agent":
-        return owner_agent_id == caller_agent_id
+        return bool(owner_agent_id and owner_agent_id == canonical_service_agent_id(caller_agent_id))
     if visibility == "scope_org":
         return True
     if not agent:
@@ -633,7 +698,7 @@ async def enforce_update(
                 AUTH_AGENT_TRUST_TOO_LOW, f"access policy: agent '{agent_id}' is restricted from updates."
             ),
         )
-    if trust < 3 and agent_id != memory_owner_agent_id:
+    if trust < 3 and canonical_service_agent_id(agent_id) != memory_owner_agent_id:
         raise HTTPException(
             status_code=403,
             detail=coded_detail(
@@ -681,12 +746,13 @@ async def update_trust_level(
     data: dict[str, Any] = {"tenant_id": tenant_id, "trust_level": trust_level}
     if fleet_id is not None:
         data["fleet_id"] = fleet_id
-    await sc.update_trust_level(agent_id, data)
+    stored_agent_id = agent["agent_id"]
+    await sc.update_trust_level(stored_agent_id, data)
     # Re-fetch to get the updated agent dict. ``read=False`` because this is a
     # read-after-write: from a replica it can return the PREVIOUS trust level,
     # and this function's own docstring calls that column the single source of
     # truth that every gate reads live. Returning the old value here would
     # report a promotion or demotion that had already been applied as not
     # having happened.
-    updated = await sc.get_agent(agent_id, tenant_id, read=False)
+    updated = await sc.get_agent(stored_agent_id, tenant_id, read=False)
     return updated or agent
